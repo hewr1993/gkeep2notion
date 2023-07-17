@@ -1,16 +1,21 @@
 #!/usr/local/bin/python3
-from argparse import ArgumentParser
 from configparser import ConfigParser
 from enum import Enum
 import os
 import getpass
+from tqdm import tqdm
+import json
 import re
+import traceback
 import keyring
 import urllib.request
+from loguru import logger
 
-from gkeepapi import Keep, node
 from notion_client import Client
 import time
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 class BlockType(str, Enum):
@@ -214,43 +219,6 @@ def get_config(path='config.ini') -> Config:
     return Config(ini)
 
 
-def authenticate(keep: Keep, email: str):
-    print('Logging into Google Keep')
-    password = getpass.getpass('Password: ')
-    print('Authenticating, this may take a while...')
-    try:
-        keep.login(email, password)
-    except Exception as e:
-        print('Authentication failed')
-        print(e)
-        exit()
-
-    # Save the auth token in keyring
-    print('Authentication is successful, saving token in keyring')
-    token = keep.getMasterToken()
-    keyring.set_password('gkeep2notion', email, token)
-    print('Token saved. Have fun with other commands!')
-
-
-def login(keep: Keep, email: str):
-    print('Loading access token from keyring')
-    token = keyring.get_password('gkeep2notion', email)
-    if token:
-        print('Authorization, this may take a while...')
-        try:
-            keep.resume(email, token)
-        except Exception as ex:
-            print('Token expired, logging in again')
-            print(ex)
-            authenticate(keep, email)
-    else:
-        authenticate(keep, email)
-
-
-def downloadFile(url, path):
-    urllib.request.urlretrieve(url, path)
-
-
 def parseBlock(p: str) -> dict:
     """Parses a line from a Keep Note into a Notion block type and text
 
@@ -293,14 +261,14 @@ def parseTextToPage(text: str, page: Page):
         page.add_text(block['text'], block['type'])
 
 
-def getNoteCategories(note: node.TopLevelNode) -> list[str]:
+def getNoteCategories(note) -> list[str]:
     categories = []
-    for label in note.labels.all():
-        categories.append(label.name)
+    for label in note.get("labels", []):
+        categories.append(label["name"])
     return categories
 
 
-def importPageWithCategories(notion: Client, note: node.TopLevelNode, root: Page, categories: dict[str, Page]) -> Page:
+def importPageWithCategories(notion: Client, note, root: Page, categories: dict[str, Page]) -> Page:
     # Extract categories
     rootName = root.title
     cats = getNoteCategories(note)
@@ -319,48 +287,42 @@ def importPageWithCategories(notion: Client, note: node.TopLevelNode, root: Page
             categories[parentKey] = parent
         cats = cats[1:]
 
-    return Page(note.title, parent.id)
+    return Page(note["title"], parent.id)
 
 
-def parseNote(note: node.TopLevelNode, page: Page, keep: Keep, config: Config):
+def parseNote(note, page: Page, config: Config):
     # TODO add background colors (currently unsupported by notion-py)
     # color = str(note.color)[len('ColorValue.'):].lower()
     # if color != 'default':
     #     parent.background = color
 
-    if config.import_media:
-        # Images
-        if len(note.images) > 0:
-            print('Uploading images is unsupported by Notion API :(')
-            # for blob in note.images:
-            #     print('Importing image ', blob.text)
-            #     url = keep.getMediaLink(blob)
-            #     downloadFile(url, 'image.png')
-            #     img: ImageBlock = page.children.add_new(
-            #         ImageBlock, title=blob.text)
-            #     img.upload_file('image.png')
+    # if config.import_media:
+    #     # Images
+    #     if len(note.images) > 0:
+    #         print('Uploading images is unsupported by Notion API :(')
+    #         # for blob in note.images:
+    #         #     print('Importing image ', blob.text)
+    #         #     url = keep.getMediaLink(blob)
+    #         #     downloadFile(url, 'image.png')
+    #         #     img: ImageBlock = page.children.add_new(
+    #         #         ImageBlock, title=blob.text)
+    #         #     img.upload_file('image.png')
 
-        # Audio
-        if len(note.audio) > 0:
-            print('Uploading audio is unsupported by Notion API :(')
-            # for blob in note.audio:
-            #     print('Importing audio ', blob.text)
-            #     url = keep.getMediaLink(blob)
-            #     downloadFile(url, 'audio.mp3')
-            #     img: AudioBlock = page.children.add_new(
-            #         AudioBlock, title=blob.text)
-            #     img.upload_file('audio.mp3')
+    #     # Audio
+    #     if len(note.audio) > 0:
+    #         print('Uploading audio is unsupported by Notion API :(')
+    #         # for blob in note.audio:
+    #         #     print('Importing audio ', blob.text)
+    #         #     url = keep.getMediaLink(blob)
+    #         #     downloadFile(url, 'audio.mp3')
+    #         #     img: AudioBlock = page.children.add_new(
+    #         #         AudioBlock, title=blob.text)
+    #         #     img.upload_file('audio.mp3')
 
     # Text
-    text = note.text
+    text = note["textContent"]
     # Render page blocks
     parseTextToPage(text, page)
-
-
-def parseList(list: node.List, page: Page):
-    item: node.ListItem
-    for item in list.items:  # type: node.ListItem
-        page.add_todo(item.text, item.checked)
 
 
 def url2uuid(url: str) -> str:
@@ -372,69 +334,45 @@ def url2uuid(url: str) -> str:
     return f"{id[0:8]}-{id[8:12]}-{id[12:16]}-{id[16:20]}-{id[20:32]}"
 
 
-argparser = ArgumentParser(
-    description='Export from Google Keep and import to Notion')
-argparser.add_argument('-l', '--labels', type=str,
-                       help='Search by labels, comma separated')
-argparser.add_argument('-q', '--query', type=str, help='Search by title query')
-
-args = argparser.parse_args()
-
 config = get_config()
 
 root_uuid = url2uuid(config.root_url)
-
-keep = Keep()
-login(keep, config.email)
 
 print('Logging into Notion')
 notion = Client(auth=config.token)
 
 notes = Page('Notes', root_uuid)
-todos = Page('TODOs', root_uuid)
 create_page(notion, notes)
-create_page(notion, todos)
 
 categories = {
     'Notes': notes,
-    'TODOs': todos
 }
 
-glabels = []
-if args.labels:
-    labels = args.labels.split(',')
-    labels = [label.strip() for label in labels]
-    labels = list(filter(lambda l: l != '', labels))
-    for label in labels:
-        glabel = keep.findLabel(label)
-        glabels.append(glabel)
-
-query = ''
-if args.query:
-    query = args.query.strip()
-
-gnotes = []
-if len(glabels) > 0:
-    gnotes = keep.find(labels=glabels)
-elif len(query) > 0:
-    gnotes = keep.find(query=query)
-else:
-    gnotes = keep.all()
+# note
+# {'color': 'DEFAULT',
+#  'isTrashed': False,
+#  'isPinned': False,
+#  'isArchived': True,
+#  'textContent': 'some text',
+#  'title': 'abcd',
+#  'userEditedTimestampUsec': 1681213823555000,
+#  'createdTimestampUsec': 1681213804317000,
+#  'labels': [{'name': 'mytag'}]}
+gnotes = [
+    json.load(open(fn))
+    for fn in (BASE_DIR / "Keep").glob("*.json")
+]
 
 i = 0
-for gnote in gnotes:
+for gnote in tqdm(gnotes):
     i += 1
-    if isinstance(gnote, node.List):
-        if not config.import_todos:
-            continue
-        print(f'Importing TODO #{i}: {gnote.title}')
-        page = importPageWithCategories(notion, gnote, todos, categories)
-        parseList(gnote, page)
-        create_page(notion, page)
-    else:
-        if not config.import_notes:
-            continue
-        print(f'Importing note #{i}: {gnote.title}')
+    print(f"Importing note #{i}: {gnote['title']}")
+    try:
         page = importPageWithCategories(notion, gnote, notes, categories)
-        parseNote(gnote, page, keep, config)
+        parseNote(gnote, page, config)
         create_page(notion, page)
+    except KeyboardInterrupt:
+        break
+    except:
+        logger.warning(f"[{i}] failed")
+        logger.debug(traceback.format_exc())
